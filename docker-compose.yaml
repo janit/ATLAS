@@ -1,0 +1,118 @@
+# ATLAS ROCm — Docker Compose
+#
+# Two modes:
+#   1. Standalone: llama-server runs directly (single GPU, default)
+#   2. Multi-GPU: set LLAMA_URL to point at an external viiwork instance
+#      that load-balances across multiple GPUs/nodes, then remove or
+#      don't start the llama-server service.
+#
+# Usage:
+#   cp atlas.conf.example atlas.conf && vim atlas.conf
+#   docker compose up -d
+
+services:
+  llama-server:
+    build:
+      context: ./llama-server
+      dockerfile: Dockerfile
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+    volumes:
+      - ${ATLAS_MODELS_DIR:-/opt/atlas/models}:/models
+    ports:
+      - "${ATLAS_LLAMA_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    ports:
+      - "${ATLAS_REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  sandbox:
+    build:
+      context: ./atlas/sandbox
+      dockerfile: Dockerfile
+    ports:
+      - "${ATLAS_SANDBOX_PORT:-8020}:8020"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8020/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  llm-proxy:
+    build:
+      context: ./llm-proxy
+      dockerfile: Dockerfile
+    environment:
+      # Points to built-in llama-server by default.
+      # For multi-GPU: set LLAMA_URL=http://<viiwork-host>:8080
+      - LLAMA_URL=${LLAMA_URL:-http://llama-server:8000}
+      - REDIS_URL=redis://redis:6379
+      - API_PORTAL_URL=  # empty: disables API key validation
+    ports:
+      - "${ATLAS_LLM_PROXY_PORT:-8080}:8000"
+    depends_on:
+      llama-server:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  rag-api:
+    build:
+      context: ./rag-api
+      dockerfile: Dockerfile
+    environment:
+      - LLM_API_URL=http://llm-proxy:8000
+      - REDIS_URL=redis://redis:6379
+      - SANDBOX_URL=http://sandbox:8020
+      - GEOMETRIC_LENS_ENABLED=${GEOMETRIC_LENS_ENABLED:-true}
+      - ROUTING_ENABLED=${ROUTING_ENABLED:-true}
+      - RETRIEVAL_MODE=${RETRIEVAL_MODE:-pageindex}
+    volumes:
+      - projects-data:/data/projects
+    ports:
+      - "${ATLAS_RAG_API_PORT:-8001}:8001"
+    depends_on:
+      llm-proxy:
+        condition: service_healthy
+      sandbox:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  projects-data:
