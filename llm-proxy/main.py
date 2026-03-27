@@ -14,7 +14,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from contextlib import asynccontextmanager
 from typing import Optional, Tuple
 
-LLAMA_URL = os.getenv("LLAMA_URL", "http://llama-service:8000")
+LLAMA_URL = os.getenv("LLAMA_URL", "http://llama-server:8000")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 API_PORTAL_URL = os.getenv("API_PORTAL_URL", "http://api-portal:3000")
 
