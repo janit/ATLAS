@@ -1,5 +1,5 @@
 #!/bin/bash
-# V3: Generation + Self-Embeddings + Speculative Decoding
+# V3: Generation + Self-Embeddings + Speculative Decoding (ROCm/Radeon VII)
 #
 # Requires ATLAS-patched llama-server (fix-embeddings-spec-decode.patch)
 # that prevents --embeddings from poisoning the draft model context.
@@ -8,8 +8,8 @@
 # clamp that --embeddings normally triggers. The patch ensures the draft
 # model context is created WITHOUT embedding=true.
 #
-# Expected throughput: ~80-100 tok/s (with spec decode)
-# VRAM: ~12.3GB main + ~0.5GB draft + ~0.9GB draft KV + ~0.7GB main KV = ~14.4GB / 16.3GB
+# Expected throughput: ~60-80 tok/s (with spec decode on Radeon VII)
+# VRAM: ~6.5GB main + ~1.0GB draft + ~0.9GB draft KV + ~0.7GB main KV = ~9.5GB / 16GB
 #
 # Draft context (-cd): Reduced from 16384 to match main per-slot context (8192)
 # to fit within 16GB VRAM. Draft needs full preceding context for spec decode.
@@ -22,18 +22,18 @@ DRAFT_CTX="${DRAFT_CTX_LENGTH:-8192}"
 KV_CACHE_TYPE="${KV_CACHE_TYPE:-q4_0}"
 KV_FLAGS="-ctk $KV_CACHE_TYPE -ctv $KV_CACHE_TYPE"
 TEMPLATE="${CHAT_TEMPLATE:-Qwen3-custom.jinja}"
-PARALLEL="${PARALLEL_SLOTS:-2}"
+PARALLEL="${PARALLEL_SLOTS:-1}"
 DRAFT_MODEL="${DRAFT_MODEL:-/models/Qwen3-0.6B-Q8_0.gguf}"
 
-export GGML_CUDA_NO_PINNED="${GGML_CUDA_NO_PINNED:-0}"
-export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
-export CUDA_MODULE_LOADING="${CUDA_MODULE_LOADING:-LAZY}"
+# ROCm environment (replaces CUDA vars from upstream)
+export HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-9.0.6}"
 
-echo "=== V3: Generation + Self-Embeddings + Speculative Decoding ==="
+echo "=== V3: Generation + Self-Embeddings + Speculative Decoding (ROCm) ==="
 echo "  Context: $CTX_LENGTH (draft: $DRAFT_CTX) | KV: $KV_CACHE_TYPE | Parallel: $PARALLEL"
 echo "  Embeddings: ENABLED (5120-dim Qwen3 self-embeddings)"
 echo "  Draft model: $DRAFT_MODEL"
 echo "  Slot save path: $SLOT_SAVE_PATH"
+echo "  HSA_OVERRIDE_GFX_VERSION: $HSA_OVERRIDE_GFX_VERSION"
 
 exec /usr/local/bin/llama-server \
   -m /models/Qwen3-14B-Q4_K_M.gguf \
