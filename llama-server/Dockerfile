@@ -4,6 +4,9 @@ FROM rocm/dev-ubuntu-24.04:6.2.4-complete AS builder
 RUN apt-get update && apt-get install -y cmake git && rm -rf /var/lib/apt/lists/*
 RUN git clone https://github.com/ggml-org/llama.cpp /llama.cpp && \
     cd /llama.cpp && \
+    # Pin to pre-FP8 commit — llama.cpp HEAD (2026-03-26+) uses __hip_fp8_e4m3
+    # which requires ROCm 6.3+, but we need 6.2.4 for gfx906 support.
+    git checkout c0159f9c1f874da15e94f371d136f5920b4b5335 && \
     # ATLAS patch: prevent --embeddings from poisoning the draft model context.
     # Without this, embedding=true propagates to the draft via params_dft = params_base,
     # causing output_all=true and n_ubatch mismatch → 0% spec decode acceptance.
