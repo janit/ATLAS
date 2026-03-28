@@ -1,3 +1,63 @@
+# ATLAS — ROCm Fork for Radeon VII
+
+> This is a fork of [itigges22/ATLAS](https://github.com/itigges22/ATLAS) adapted for **AMD Radeon VII (gfx906)** GPUs using **ROCm 6.2.4** and **Docker Compose** (replacing K3s/CUDA).
+
+## Quick Start
+
+```bash
+# 1. Download models
+mkdir -p /opt/atlas/models
+# Download Qwen3-14B-Q4_K_M.gguf and Qwen3-0.6B-Q8_0.gguf to /opt/atlas/models/
+
+# 2. Configure
+cp atlas.conf.example atlas.conf
+vim atlas.conf  # set ATLAS_MODELS_DIR
+
+# 3. Install and start
+./scripts/install.sh
+```
+
+## What Changed From Upstream
+
+| Component | Upstream | This Fork |
+|-----------|----------|-----------|
+| GPU | NVIDIA (CUDA 12.8) | AMD Radeon VII (ROCm 6.2.4) |
+| Orchestration | K3s (Kubernetes) | Docker Compose |
+| Inference | Standalone llama-server pod | viiwork load balancer (built into llama-server image) |
+| Auth | api-portal (JWT + API keys) | Removed (not needed for self-hosted) |
+| Dashboard | atlas-dashboard | Removed |
+| Task worker | task-worker service | Removed |
+
+## Services
+
+| Service | Port | Purpose |
+|---------|------|---------|
+| llama-server | 8000 | GPU inference (ROCm, spec decode, embeddings) |
+| rag-api | 8001 | V3 pipeline orchestration |
+| llm-proxy | 8080 | Rate limiting + metrics |
+| sandbox | 8020 | Isolated code execution |
+| Redis | 6379 | Pattern cache + state |
+
+## Multi-GPU with Viiwork
+
+For multi-GPU load balancing across Radeon VIIs, run [viiwork](https://github.com/janit/viiwork) separately and point ATLAS at it:
+
+```bash
+# In atlas.conf:
+LLAMA_URL=http://<viiwork-host>:8080
+```
+
+Viiwork handles load balancing, mesh routing across nodes, and the `/v1/embeddings` endpoint for Geometric Lens.
+
+## Requirements
+
+- AMD Radeon VII (16GB) or compatible gfx906 GPU
+- ROCm 6.2.4 drivers installed on host
+- Docker with Compose V2
+- ~20GB disk for model files
+
+---
+
 <p align="center">
   <img src="docs/images/banner.png" alt="A.T.L.A.S" width="100%">
 </p>
