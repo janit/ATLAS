@@ -19,7 +19,6 @@ RUN ldd /llama.cpp/build/bin/llama-server && /llama.cpp/build/bin/llama-server -
 
 FROM rocm/dev-ubuntu-24.04:6.2.4-complete
 COPY --from=builder /llama.cpp/build/bin/llama-server /usr/local/bin/
-COPY --from=builder /llama.cpp/build/bin/llama-cli /usr/local/bin/
 # Copy shared libraries built by llama.cpp
 COPY --from=builder /llama.cpp/build /tmp/llama-build/
 RUN find /tmp/llama-build -name '*.so*' -exec cp {} /usr/local/lib/ \; && rm -rf /tmp/llama-build && ldconfig
