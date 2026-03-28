@@ -1,548 +1,111 @@
 #!/bin/bash
 set -euo pipefail
 
-# ATLAS Installation Script
-# Installs K3s, NVIDIA GPU Operator, and deploys all services
+#===========================================
+# ATLAS Install (ROCm / Docker Compose)
+#===========================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/lib/config.sh"
-
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
-# Validate paths in configuration
-validate_paths() {
-    local errors=0
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-    log_info "Validating configuration paths..."
+# Load config
+if [ -f "$PROJECT_DIR/atlas.conf" ]; then
+    source "$PROJECT_DIR/atlas.conf"
+    info "Loaded atlas.conf"
+else
+    error "atlas.conf not found. Run: cp atlas.conf.example atlas.conf"
+fi
 
-    # Check ATLAS_MODELS_DIR
-    if [[ ! -d "$ATLAS_MODELS_DIR" ]]; then
-        log_error "ATLAS_MODELS_DIR does not exist: $ATLAS_MODELS_DIR"
-        log_error "  Please create the directory or update atlas.conf"
-        log_error "  Example: mkdir -p $ATLAS_MODELS_DIR"
-        errors=$((errors + 1))
+MODELS_DIR="${ATLAS_MODELS_DIR:-/opt/atlas/models}"
+
+#-------------------------------------------
+# Pre-flight checks
+#-------------------------------------------
+info "Running pre-flight checks..."
+
+# Docker
+command -v docker >/dev/null 2>&1 || error "Docker not found. Install: https://docs.docker.com/engine/install/"
+docker compose version >/dev/null 2>&1 || error "Docker Compose V2 not found."
+
+# ROCm
+if [ ! -d /dev/dri ]; then
+    error "/dev/dri not found. ROCm drivers not installed."
+fi
+if [ ! -e /dev/kfd ]; then
+    error "/dev/kfd not found. ROCm kernel driver (amdgpu) not loaded."
+fi
+info "ROCm devices found: /dev/kfd, /dev/dri"
+
+# Check GPU access
+if command -v rocm-smi >/dev/null 2>&1; then
+    GPU_COUNT=$(rocm-smi --showid 2>/dev/null | grep -c "GPU" || echo "0")
+    info "Detected $GPU_COUNT AMD GPU(s)"
+else
+    warn "rocm-smi not found on host. GPU detection skipped (will work inside container)."
+fi
+
+# Models
+if [ ! -d "$MODELS_DIR" ]; then
+    error "Models directory not found: $MODELS_DIR"
+fi
+if [ ! -f "$MODELS_DIR/Qwen3-14B-Q4_K_M.gguf" ]; then
+    error "Main model not found: $MODELS_DIR/Qwen3-14B-Q4_K_M.gguf"
+fi
+if [ ! -f "$MODELS_DIR/Qwen3-0.6B-Q8_0.gguf" ]; then
+    warn "Draft model not found: $MODELS_DIR/Qwen3-0.6B-Q8_0.gguf (spec decode disabled)"
+fi
+info "Models directory: $MODELS_DIR"
+
+#-------------------------------------------
+# Build and start
+#-------------------------------------------
+info "Building containers..."
+cd "$PROJECT_DIR"
+docker compose build
+
+info "Starting services..."
+docker compose up -d
+
+info "Waiting for services to become healthy..."
+TIMEOUT=300
+ELAPSED=0
+while [ $ELAPSED -lt $TIMEOUT ]; do
+    HEALTHY=$(docker compose ps --format json 2>/dev/null | grep -c '"healthy"' || echo "0")
+    TOTAL=$(docker compose ps --format json 2>/dev/null | wc -l || echo "0")
+    if [ "$HEALTHY" -eq "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
+        break
     fi
+    echo -n "."
+    sleep 5
+    ELAPSED=$((ELAPSED + 5))
+done
+echo ""
 
-    # Check for main model file
-    if [[ -n "$ATLAS_MAIN_MODEL" ]]; then
-        if [[ ! -f "$ATLAS_MODELS_DIR/$ATLAS_MAIN_MODEL" ]] && [[ ! -f "$ATLAS_MODELS_DIR/default.gguf" ]]; then
-            log_error "Main model not found: $ATLAS_MODELS_DIR/$ATLAS_MAIN_MODEL"
-            log_error "  Download with: ./scripts/download-models.sh"
-            log_error "  Or update ATLAS_MAIN_MODEL in atlas.conf"
-            errors=$((errors + 1))
-        fi
-    fi
-
-    # Check ATLAS_LORA_DIR (create if missing, it's optional)
-    if [[ ! -d "$ATLAS_LORA_DIR" ]]; then
-        log_warn "ATLAS_LORA_DIR does not exist, creating: $ATLAS_LORA_DIR"
-        mkdir -p "$ATLAS_LORA_DIR" 2>/dev/null || {
-            log_error "Failed to create ATLAS_LORA_DIR: $ATLAS_LORA_DIR"
-            errors=$((errors + 1))
-        }
-    fi
-
-    # Check for placeholder paths that weren't updated
-    if [[ "$ATLAS_MODELS_DIR" == *"yourusername"* ]] || [[ "$ATLAS_MODELS_DIR" == *"nobase"* ]]; then
-        log_error "ATLAS_MODELS_DIR contains placeholder path: $ATLAS_MODELS_DIR"
-        log_error "  Please update atlas.conf with your actual path"
-        log_error "  Example: ATLAS_MODELS_DIR=\"/home/$(logname)/models\""
-        errors=$((errors + 1))
-    fi
-
-    if [[ $errors -gt 0 ]]; then
-        log_error "Path validation failed with $errors error(s)"
-        log_error "Please fix the above issues in atlas.conf and re-run"
-        return 1
-    fi
-
-    log_info "Path validation passed"
-    return 0
-}
-
-# Detect hardware and auto-configure resources
-detect_hardware() {
-    log_info "Detecting hardware configuration..."
-
-    # Detect CPU cores
-    local cpu_cores=$(nproc)
-    log_info "  CPU cores: $cpu_cores"
-
-    # Detect system memory (in GB)
-    local sys_mem_gb=$(free -g | awk '/^Mem:/{print $2}')
-    log_info "  System RAM: ${sys_mem_gb}GB"
-
-    # Detect GPU memory (in MB)
-    local gpu_mem_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
-    local gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
-    log_info "  GPU: $gpu_name (${gpu_mem_mb}MB VRAM)"
-
-    # Calculate recommended resource limits based on hardware
-    # Reserve 1 CPU for system, distribute rest among services
-    local available_cpu=$((cpu_cores - 1))
-    if [[ $available_cpu -lt 2 ]]; then
-        available_cpu=2
-    fi
-
-    # LLM server gets 25% of available CPU (min 0.5, max 2)
-    local llama_cpu_req=$(echo "scale=1; $available_cpu * 0.25" | bc)
-    if (( $(echo "$llama_cpu_req < 0.5" | bc -l) )); then
-        llama_cpu_req="0.5"
-    elif (( $(echo "$llama_cpu_req > 2" | bc -l) )); then
-        llama_cpu_req="2"
-    fi
-
-    # Other services share remaining CPU (min 0.25 each)
-    local service_cpu_req=$(echo "scale=2; ($available_cpu - $llama_cpu_req) / 8" | bc)
-    if (( $(echo "$service_cpu_req < 0.25" | bc -l) )); then
-        service_cpu_req="0.25"
-    elif (( $(echo "$service_cpu_req > 0.5" | bc -l) )); then
-        service_cpu_req="0.5"
-    fi
-
-    # Memory allocation (LLM needs most for model loading)
-    local llama_mem_req="8Gi"
-    local llama_mem_limit="16Gi"
-    if [[ $sys_mem_gb -lt 16 ]]; then
-        llama_mem_req="4Gi"
-        llama_mem_limit="8Gi"
-        log_warn "Low system RAM detected. Reducing LLM memory allocation."
-    fi
-
-    # Export detected values for template processing
-    export DETECTED_CPU_CORES=$cpu_cores
-    export DETECTED_SYS_MEM_GB=$sys_mem_gb
-    export DETECTED_GPU_MEM_MB=$gpu_mem_mb
-
-    log_info "  Recommended LLM CPU request: $llama_cpu_req"
-    log_info "  Recommended service CPU request: $service_cpu_req"
-
-    # Check if current config exceeds hardware
-    local total_cpu_requests=$(echo "$ATLAS_LLAMA_CPU_REQUEST + ($ATLAS_SERVICE_CPU_REQUEST * 8)" | bc 2>/dev/null || echo "0")
-    if (( $(echo "$total_cpu_requests > $available_cpu" | bc -l 2>/dev/null || echo "0") )); then
-        log_warn "Config requests ${total_cpu_requests} CPUs but only ${available_cpu} available"
-        log_warn "Consider updating atlas.conf:"
-        log_warn "  ATLAS_LLAMA_CPU_REQUEST=\"$llama_cpu_req\""
-        log_warn "  ATLAS_SERVICE_CPU_REQUEST=\"$service_cpu_req\""
-    fi
-}
-
-# Check prerequisites
-check_prerequisites() {
-    log_info "Checking prerequisites..."
-
-    # Check if running as root or with sudo
-    if [[ $EUID -ne 0 ]]; then
-        log_error "This script must be run as root or with sudo"
-        exit 1
-    fi
-
-    # Check for NVIDIA GPU
-    if ! command -v nvidia-smi &> /dev/null; then
-        log_error "NVIDIA driver not found. Install NVIDIA drivers first."
-        exit 1
-    fi
-
-    # Detect and display hardware
-    detect_hardware
-
-    # Check GPU memory
-    GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
-    if [[ $GPU_MEM -lt 15000 ]]; then
-        log_warn "GPU has ${GPU_MEM}MB VRAM. 16GB+ recommended for $ATLAS_MAIN_MODEL."
-    fi
-
-    # Check system memory
-    SYS_MEM=$(free -g | awk '/^Mem:/{print $2}')
-    if [[ $SYS_MEM -lt 16 ]]; then
-        log_warn "System has ${SYS_MEM}GB RAM. 16GB+ recommended."
-    fi
-
-    # Validate paths
-    if ! validate_paths; then
-        exit 1
-    fi
-
-    # Validate config (ports, etc.)
-    if ! validate_config; then
-        log_error "Configuration validation failed"
-        exit 1
-    fi
-
-    log_info "Prerequisites check passed"
-}
-
-# Check if all required images exist in K3s
-check_images_exist() {
-    # V1 components (Qdrant, embedding-service) removed in V2
-    local required_images=(
-        "llama-server"
-        "rag-api"
-        "api-portal"
-        "llm-proxy"
-        "sandbox"
-        "task-worker"
-        "atlas-dashboard"
-    )
-
-    # Get list of images once (requires root for k3s ctr)
-    local images_list
-    images_list=$(/usr/local/bin/k3s ctr images list 2>/dev/null) || return 1
-
-    for img in "${required_images[@]}"; do
-        if ! echo "$images_list" | grep -q "localhost/$img:latest"; then
-            return 1
-        fi
-    done
-    return 0
-}
-
-# Detect current installation state
-detect_existing_setup() {
-    echo ""
-    log_info "Detecting existing setup..."
-
-    SKIP_K3S=false
-    SKIP_GPU=false
-    SKIP_NAMESPACE=false
-
-    # Check K3s
-    if command -v k3s &> /dev/null && systemctl is-active --quiet k3s 2>/dev/null; then
-        log_info "  [FOUND] K3s is installed and running"
-        SKIP_K3S=true
-    else
-        log_info "  [MISSING] K3s - will install"
-    fi
-
-    # Check GPU availability (either via device plugin or GPU operator)
-    if kubectl get nodes -o json 2>/dev/null | grep -q '"nvidia.com/gpu"'; then
-        log_info "  [FOUND] GPU available in cluster (nvidia.com/gpu)"
-        SKIP_GPU=true
-
-        # Identify which method is providing GPU access
-        if kubectl get ds -n kube-system nvidia-device-plugin-daemonset &>/dev/null; then
-            log_info "         (via NVIDIA device plugin)"
-        elif kubectl get namespace gpu-operator &>/dev/null; then
-            log_info "         (via NVIDIA GPU Operator)"
-        fi
-    else
-        log_info "  [MISSING] GPU not visible to cluster - will configure"
-    fi
-
-    # Check namespace
-    if kubectl get namespace "$ATLAS_NAMESPACE" &>/dev/null; then
-        log_info "  [FOUND] Namespace '$ATLAS_NAMESPACE' exists"
-        SKIP_NAMESPACE=true
-    else
-        log_info "  [MISSING] Namespace '$ATLAS_NAMESPACE' - will create"
-    fi
-
-    # Check if ATLAS services are already running
-    RUNNING_PODS=$(kubectl get pods -n "$ATLAS_NAMESPACE" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
-    RUNNING_PODS=${RUNNING_PODS:-0}
-    if [[ "$RUNNING_PODS" -gt 0 ]]; then
-        log_info "  [FOUND] $RUNNING_PODS ATLAS pod(s) already running"
-        log_info "         (kubectl apply will update existing deployments)"
-    fi
-
-    # Check if container images are already in K3s
-    SKIP_BUILD=false
-    if check_images_exist 2>/dev/null; then
-        log_info "  [FOUND] Container images already in K3s"
-        SKIP_BUILD=true
-    else
-        log_info "  [MISSING] Container images - will build"
-    fi
-
-    echo ""
-}
-
-# Install K3s
-install_k3s() {
-    if [[ "$SKIP_K3S" == "true" ]]; then
-        log_info "Skipping K3s installation (already running)"
-        return
-    fi
-
-    if command -v k3s &> /dev/null; then
-        log_info "K3s binary found, checking status..."
-        if systemctl is-active --quiet k3s 2>/dev/null; then
-            log_info "K3s already running"
-            return
-        fi
-        log_info "K3s installed but not running, starting..."
-        systemctl start k3s
-        sleep 10
-        kubectl wait --for=condition=Ready nodes --all --timeout=120s
-        return
-    fi
-
-    log_info "Installing K3s..."
-    curl -sfL https://get.k3s.io | sh -s - --write-kubeconfig-mode 644
-
-    # Wait for K3s to be ready
-    log_info "Waiting for K3s to be ready..."
-    sleep 10
-    kubectl wait --for=condition=Ready nodes --all --timeout=120s
-
-    log_info "K3s installed successfully"
-}
-
-# Check if GPU is already available in cluster
-check_gpu_available() {
-    kubectl get nodes -o json 2>/dev/null | grep -q '"nvidia.com/gpu"'
-}
-
-# Install NVIDIA GPU Operator (or skip if GPU already available)
-install_gpu_operator() {
-    # Skip if detection already found GPU
-    if [[ "$SKIP_GPU" == "true" ]]; then
-        log_info "Skipping GPU setup (already available in cluster)"
-        return
-    fi
-
-    # Double-check GPU availability
-    if check_gpu_available; then
-        log_info "GPU already available in cluster (nvidia.com/gpu detected)"
-        log_info "Skipping GPU Operator installation"
-        return
-    fi
-
-    # Check if GPU Operator is already installed
-    if kubectl get namespace gpu-operator &> /dev/null; then
-        log_info "GPU Operator namespace exists, checking status..."
-        if kubectl get pods -n gpu-operator 2>/dev/null | grep -q "Running"; then
-            log_info "GPU Operator already running"
-            return
-        fi
-    fi
-
-    log_info "Installing NVIDIA GPU Operator..."
-
-    # Add Helm repo
-    if ! command -v helm &> /dev/null; then
-        log_info "Installing Helm..."
-        curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-    fi
-
-    helm repo add nvidia https://helm.ngc.nvidia.com/nvidia || true
-    helm repo update
-
-    # Install GPU Operator
-    kubectl create namespace gpu-operator || true
-    helm install gpu-operator nvidia/gpu-operator \
-        --namespace gpu-operator \
-        --set driver.enabled=false \
-        --wait --timeout 10m
-
-    # Wait for GPU to be available
-    log_info "Waiting for GPU to be available in cluster..."
-    for i in {1..30}; do
-        if check_gpu_available; then
-            log_info "GPU available in cluster"
-            return
-        fi
-        sleep 10
-    done
-
-    log_error "GPU not detected in cluster after 5 minutes"
+if [ $ELAPSED -ge $TIMEOUT ]; then
+    warn "Timeout waiting for all services. Check: docker compose ps"
+    docker compose ps
     exit 1
-}
+fi
 
-# Create namespaces and secrets
-setup_namespace() {
-    log_info "Setting up namespace and secrets..."
+info "All services healthy!"
+docker compose ps
 
-    # Create namespace if not default
-    if [[ "$ATLAS_NAMESPACE" != "default" ]]; then
-        kubectl create namespace "$ATLAS_NAMESPACE" || true
-    fi
-
-    # Create secrets if they don't exist
-    if ! kubectl get secret atlas-secrets -n "$ATLAS_NAMESPACE" &> /dev/null; then
-        # Use JWT secret from config
-        API_SECRET=$(openssl rand -hex 32)
-
-        kubectl create secret generic atlas-secrets -n "$ATLAS_NAMESPACE" \
-            --from-literal=jwt-secret="$ATLAS_JWT_SECRET" \
-            --from-literal=api-secret="$API_SECRET" || true
-    fi
-
-    log_info "Namespace and secrets ready"
-}
-
-# Build container images
-build_images() {
-    # Check if images already exist in K3s
-    if [[ "${FORCE_BUILD:-false}" != "true" ]] && check_images_exist; then
-        log_info "All container images already exist in K3s - skipping build"
-        log_info "  (use FORCE_BUILD=true to rebuild)"
-        return 0
-    fi
-
-    log_info "Building container images..."
-
-    "$SCRIPT_DIR/build-containers.sh"
-
-    log_info "Container images built"
-}
-
-# Process templates with environment variable substitution
-process_templates() {
-    log_info "Processing manifest templates..."
-
-    local template_dir="$K8S_DIR/templates"
-    local manifest_dir="$K8S_DIR/manifests"
-
-    # Ensure manifests directory exists
-    mkdir -p "$manifest_dir"
-
-    # Export all ATLAS_ variables for envsubst
-    export "${!ATLAS_@}"
-
-    # Process each template file
-    for tmpl in "$template_dir"/*.yaml.tmpl; do
-        if [[ -f "$tmpl" ]]; then
-            local filename=$(basename "$tmpl" .tmpl)
-            log_info "  Processing $filename..."
-            envsubst < "$tmpl" > "$manifest_dir/$filename"
-        fi
-    done
-
-    log_info "Templates processed"
-}
-
-# Deploy manifests
-deploy_manifests() {
-    log_info "Deploying ATLAS services..."
-
-    # Process templates first to substitute config values
-    process_templates
-
-    # V1 components (Qdrant, embedding-service) removed in V2
-
-    # Deploy infrastructure first (Redis is dependency)
-    log_info "Deploying infrastructure..."
-    kubectl apply -n "$ATLAS_NAMESPACE" -f "$K8S_DIR/manifests/redis-deployment.yaml"
-
-    # Wait for dependencies
-    log_info "Waiting for infrastructure services..."
-    kubectl wait --for=condition=Ready pod -l app=redis -n "$ATLAS_NAMESPACE" --timeout=120s || true
-
-    # Deploy main services
-    log_info "Deploying main services..."
-    kubectl apply -n "$ATLAS_NAMESPACE" -f "$K8S_DIR/manifests/llama-deployment.yaml"
-    kubectl apply -n "$ATLAS_NAMESPACE" -f "$K8S_DIR/manifests/api-portal-deployment.yaml"
-    kubectl apply -n "$ATLAS_NAMESPACE" -f "$K8S_DIR/manifests/rag-api-deployment.yaml"
-    kubectl apply -n "$ATLAS_NAMESPACE" -f "$K8S_DIR/manifests/llm-proxy-deployment.yaml"
-
-    # Deploy Atlas services
-    log_info "Deploying Atlas services..."
-    kubectl apply -n "$ATLAS_NAMESPACE" -f "$K8S_DIR/manifests/sandbox-deployment.yaml"
-    kubectl apply -n "$ATLAS_NAMESPACE" -f "$K8S_DIR/manifests/task-worker-deployment.yaml"
-    kubectl apply -n "$ATLAS_NAMESPACE" -f "$K8S_DIR/manifests/dashboard-deployment.yaml"
-
-    # Apply training CronJob if enabled
-    if [[ "$ATLAS_ENABLE_TRAINING" == "true" ]]; then
-        kubectl apply -n "$ATLAS_NAMESPACE" -f "$K8S_DIR/manifests/training-cronjob.yaml" || true
-    fi
-
-    log_info "Manifests deployed"
-}
-
-# Wait for all services
-wait_for_services() {
-    log_info "Waiting for all services to be ready..."
-
-    # Service names as defined in deployments
-    # V1 components (Qdrant, embedding-service) removed in V2
-    SERVICES="redis llama-server api-portal rag-api llm-proxy sandbox task-worker atlas-dashboard"
-
-    for svc in $SERVICES; do
-        log_info "Waiting for $svc..."
-        kubectl wait --for=condition=Ready pod -l app=$svc -n "$ATLAS_NAMESPACE" --timeout=300s || {
-            log_warn "$svc not ready within timeout, continuing..."
-        }
-    done
-
-    log_info "All services deployed"
-}
-
-# Main
-main() {
-    echo "=========================================="
-    echo "  ATLAS Installation Script"
-    echo "=========================================="
-    echo ""
-    echo "Configuration:"
-    echo "  Models dir:  $ATLAS_MODELS_DIR"
-    echo "  Data dir:    $ATLAS_DATA_DIR"
-    echo "  Namespace:   $ATLAS_NAMESPACE"
-    echo ""
-
-    check_prerequisites
-    detect_existing_setup
-
-    # Show summary of what will happen
-    echo "Installation plan:"
-    if [[ "$SKIP_K3S" == "true" ]]; then
-        echo "  - K3s:          SKIP (already running)"
-    else
-        echo "  - K3s:          INSTALL"
-    fi
-    if [[ "$SKIP_GPU" == "true" ]]; then
-        echo "  - GPU setup:    SKIP (already available)"
-    else
-        echo "  - GPU setup:    INSTALL (GPU Operator via Helm)"
-    fi
-    if [[ "$SKIP_BUILD" == "true" ]]; then
-        echo "  - Build images: SKIP (already in K3s)"
-    else
-        echo "  - Build images: RUN"
-    fi
-    echo "  - Deploy:       RUN (kubectl apply - safe to re-run)"
-    echo ""
-
-    # Give user a chance to abort
-    if [[ "${ATLAS_AUTO_CONFIRM:-false}" != "true" ]]; then
-        read -p "Continue with installation? [Y/n] " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Nn]$ ]]; then
-            log_info "Installation cancelled"
-            exit 0
-        fi
-    fi
-
-    install_k3s
-    install_gpu_operator
-    setup_namespace
-    build_images
-    deploy_manifests
-    wait_for_services
-
-    echo ""
-    echo "=========================================="
-    echo "  Installation Complete!"
-    echo "=========================================="
-    echo ""
-    echo "Next steps:"
-    echo "  1. Download models: ./scripts/download-models.sh"
-    echo "  2. Verify installation: ./scripts/verify-install.sh"
-    echo ""
-    echo "Service endpoints:"
-    echo "  API Portal:  http://${ATLAS_NODE_IP}:${ATLAS_API_PORTAL_NODEPORT}"
-    echo "  LLM Proxy:   http://${ATLAS_NODE_IP}:${ATLAS_LLM_PROXY_NODEPORT}"
-    echo "  RAG API:     http://${ATLAS_NODE_IP}:${ATLAS_RAG_API_NODEPORT}"
-    echo "  Dashboard:   http://${ATLAS_NODE_IP}:${ATLAS_DASHBOARD_NODEPORT}"
-    echo ""
-}
-
-main "$@"
+echo ""
+info "ATLAS is running. Endpoints:"
+info "  rag-api:   http://localhost:${ATLAS_RAG_API_PORT:-8001}/v1/chat/completions"
+info "  llm-proxy: http://localhost:${ATLAS_LLM_PROXY_PORT:-8080}/v1/chat/completions"
+info "  llama:     http://localhost:${ATLAS_LLAMA_PORT:-8000}/health"
+echo ""
+info "Test with:"
+info "  curl http://localhost:${ATLAS_RAG_API_PORT:-8001}/v1/chat/completions \\"
+info "    -H 'Content-Type: application/json' \\"
+info "    -d '{\"model\":\"Qwen3-14B-Q4_K_M\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
